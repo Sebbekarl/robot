@@ -1,0 +1,330 @@
+#!/usr/bin/env python
+#################################################################################
+# Copyright 2018 ROBOTIS CO., LTD.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+#################################################################################
+
+# Authors: Gilbert #
+
+import rospy
+import time
+import math
+from sensor_msgs.msg import LaserScan
+from geometry_msgs.msg import Twist
+
+from nav_msgs.msg import Odometry
+
+import smbus
+
+
+EVEN = False
+LINEAR_VEL = 0.22
+ANGULAR_VEL=2.84
+STOP_DISTANCE = 0.3
+LIDAR_ERROR = 0.05
+SAFE_STOP_DISTANCE = STOP_DISTANCE + LIDAR_ERROR
+
+
+ROBOT_WIDTH=0.30
+
+direction_coefficient=1
+stuckCount=0
+
+
+# Get I2C bus
+#bus = smbus.SMBus(1)
+
+# ISL29125 address, 0x44(68)
+# Select configuation-1register, 0x01(01)
+# 0x0D(13) Operation: RGB, Range: 360 lux, Res: 16 Bits
+#bus.write_byte_data(0x44, 0x01, 0x05)
+
+
+#RGB reading function
+# def getAndUpdateColour():
+# 	# Read the data from the sensor
+#         data = bus.read_i2c_block_data(0x44,0x09,6)
+
+#         # Convert the data to green, red and blue int values
+#         green = data[1]*256+data[0]
+#         red = data[3]*256+data[2]
+#         blue = data[5]*256+data[4]
+#         # Output data to the console RGB values
+#         # Uncomment the line below when you have read the red, green and blue values
+#         print("RGB(%d %d %d)" % (red, green, blue))
+#a
+def callback(data):
+    #Print current velocity
+    rospy.loginfo(data.twist.twist.linear.x)
+    rospy.loginfo(data.twist.twist.angular.z)
+
+
+def collideCheckV2(scanList):
+
+    danger_list=[]
+    zones_detection_angle = [0,0,0]
+    zones_min_distance = [10,10,10]
+    zone_angle = 40
+
+    #Check if there is any danger value in array. If so, return index of the lowest distance.
+    res = []
+    for nr, i in enumerate(scanList):
+        if i > 0:
+            res.append(i)
+
+            if (scanList[nr-2] == 0 and scanList[nr+2]==0) or (scanList[nr-1] == 0 and scanList[nr+1]==0) :
+                scanList[nr]=0
+    if len(res) < 4:
+        return True, 90, zones_detection_angle, zones_min_distance , danger_list
+    
+    #Determine if robot needs to take decision yet (is obstacle close enough?). Also, where will it collide?
+    for nr, i in enumerate(scanList):
+        angle = nr-90.0
+        weight = (1-(abs(angle)/130.0))
+        scalar=1
+        if nr < zone_angle:
+            zone_index = 0
+        elif nr >  180 - zone_angle:
+            zone_index = 2
+        else:
+            zone_index = 1    
+
+        if (i>0.05 and i<scalar): #and abs(angle)<= 50): 
+            danger_list.append(i)
+            #zones_detection_count[zone_index] += 1
+            
+            if i < zones_min_distance[zone_index]:
+                zones_min_distance[zone_index] = i
+                zones_detection_angle[zone_index] = abs(angle)
+                
+        else:
+            danger_list.append(0)
+    
+    
+
+
+
+    if any(i > 0 for i in danger_list) and len(res)>6:
+        return True, danger_list.index(min(i for i in danger_list if i > 0)), zones_detection_angle, zones_min_distance , danger_list
+        #return True, danger_list.index(min(i for i in danger_list if i > 0)), danger_list
+        
+    else:
+        return False, 90, zones_detection_angle, zones_min_distance , danger_list
+    
+
+
+
+def optimizedTurn(robot, turn, zones_angle, zones_min_distance, danger_list):
+    #Read from which side the obstacle is. Implemented later
+    global direction_coefficient
+    global stuckCount
+    scaling_func = lambda in_start, out_start, in_end, out_end, input_value : (((out_end-out_start)/(in_end-in_start))*(input_value-in_start)) + out_start
+    direction_scanscalar= 0 if direction_coefficient==1 else 0.02
+    
+
+    twist = Twist()
+    cone_angle = 30
+    angle_to_wall = abs(90-turn)
+
+    distance_to_right_wall = zones_min_distance[0]/math.cos((zones_angle[0]/180)*3.14)
+    distance_to_left_wall = zones_min_distance[2]/math.cos((zones_angle[2]/180)*3.14)
+    distance_to_closest_wall = danger_list[turn]/math.cos((angle_to_wall/180)*3.14) if angle_to_wall < cone_angle else danger_list[turn]
+    
+    front_distance = 0.5
+    front_collision_turn_speed = 0.7
+    front_quick_turn_speed = 1
+    
+    max_turn_speed_distance = 0.2
+    max_turn_speed = 1.7
+    min_turn_speed = 0.7
+    max_speed = 0.22
+    min_speed = 0.05
+    quick_turn_distance = 0.3 #scaling_func(0, 0.25, 90, 0.2, angle_to_wall)
+    normal_turn_distance = 0.2 #scaling_func(0, 0.35, 90, 0.3, angle_to_wall) if angle_to_wall > cone_angle else front_distance
+    chance_direction_distance = 0.2
+    turn_speed= scaling_func(0, 1.7, 90, 0.6, angle_to_wall) if angle_to_wall > cone_angle else front_collision_turn_speed
+    
+    twist.linear.x=0.22
+    if turn <= 90 and distance_to_closest_wall < normal_turn_distance:
+         twist.angular.z=turn_speed
+    elif distance_to_closest_wall < normal_turn_distance:
+        twist.angular.z=(-turn_speed)
+    elif zones_min_distance[1] < front_distance:
+        if turn <= 90:
+            twist.angular.z = front_collision_turn_speed
+        else:
+            twist.angular.z = -front_collision_turn_speed
+            
+    else:
+        twist.angular.z=0
+        
+        
+    # rospy.loginfo(angle_to_wall)
+    # rospy.loginfo(quick_turn_distance)
+    rospy.loginfo(zones_min_distance)
+    
+    if zones_min_distance[0] < chance_direction_distance and zones_min_distance[1] < chance_direction_distance and zones_min_distance[2] < chance_direction_distance:# or stuckCount>9:
+        rospy.loginfo("Change direction")
+        stuckCount=0
+        direction_coefficient*=-1
+        twist.angular.z=0
+        robot._cmd_pub.publish(twist)
+        rospy.sleep(0.1)
+        
+        
+    
+    if distance_to_closest_wall<quick_turn_distance:
+
+        if turn <= 90:
+            twist.angular.z= scaling_func(quick_turn_distance, min_turn_speed, max_turn_speed_distance, max_turn_speed, distance_to_closest_wall)
+        else:
+            twist.angular.z=-scaling_func(quick_turn_distance, min_turn_speed, max_turn_speed_distance, max_turn_speed, distance_to_closest_wall)
+
+        twist.linear.x= scaling_func(quick_turn_distance, max_speed, chance_direction_distance, min_speed, distance_to_closest_wall)
+    
+
+    # rospy.loginfo(twist.linear.x)
+    # rospy.loginfo(twist.angular.z)
+    
+    twist.linear.x *= direction_coefficient
+    robot._cmd_pub.publish(twist)
+    
+    # theta_outer=40
+
+    # scalar=(1-abs((turn-90))/130.0)
+    # theta=60
+    # theta_inner=70
+    # theta_diag=70
+
+    #Change to be a dynamic range dependent on scan range
+    # twist.linear.x=direction_coefficient*0.22
+    # if turn <= 90 and turn<=180-theta_outer and turn>=theta_outer:
+    #     twist.angular.z=1.3+(1-(danger_list[turn]/0.5))*1.95
+    # elif turn<=180-theta_outer and turn>=theta_outer:
+    #     twist.angular.z=-1.3+(1-(danger_list[turn]/0.5))*1.95
+
+
+    # rospy.loginfo(turn)
+    # #rospy.loginfo(danger_list)
+
+    # #rospy.loginfo(stuckCount)
+
+    # #Evaluate if there needs to be a sharper turn:
+    # if (danger_list[turn]<0.14+direction_scanscalar and turn<=180-theta_inner and turn>=theta_inner) or (danger_list[turn]<0.20+direction_scanscalar and turn>=180-theta_diag and turn<=theta_diag):# or stuckCount>9:
+    #         rospy.loginfo("Change direction")
+    #         stuckCount=0
+
+    #         direction_coefficient*=-1
+    #         #twist.angular.z*=0.2*(2.2*(1-(danger_list[turn]/0.3)))
+    #         #twist.linear.x=direction_coefficient*(0.08-((1-(danger_list[turn]/0.13))*0.08))
+    #         twist.angular.z=0
+    #         robot._cmd_pub.publish(twist)
+    #         #rospy.sleep(0.2) #Test in real life to test how far it needs to go.
+
+
+    # elif danger_list[turn]/scalar<0.35+direction_scanscalar and turn<=180-theta and turn>=theta:
+
+    #         if turn <= 90:
+    #             twist.angular.z=1
+    #         else:
+    #             twist.angular.z=-1
+
+    #         twist.linear.x=direction_coefficient*(0.22-((1-(danger_list[turn]/0.35))*0.22))
+
+    #         twist.angular.z*=(1-(danger_list[turn]/0.35))*1.95+1.3#(2.84*(1-(danger_list[turn]/0.3)))
+
+    # #Check count before changing speed. Abs because speed indicates direction.
+    # if abs(twist.linear.x)<0.14:
+    #     stuckCount+=1
+    # else:
+    #     stuckCount=0
+
+    #Post the instructions:
+    	
+
+
+
+class Obstacle():
+
+    def __init__(self):
+
+        self._cmd_pub = rospy.Publisher('cmd_vel', Twist, queue_size=1)
+        self.obstacle()
+
+
+    def get_scan(self):
+        scan = rospy.wait_for_message('scan', LaserScan)
+        scan_filter = []
+       
+        samples = len(scan.ranges)  # The number of samples is defined in 
+                                    # turtlebot3_<model>.gazebo.xacro file,
+                                    # the default is 360.
+        samples_view = 1            # 1 <= samples_view <= samples
+        
+        #print(samples)
+        if samples_view > samples:
+            samples_view = samples
+
+        if samples_view == 1:
+            scan_filter=[scan.ranges[i-(direction_coefficient*90)] for i in range(180)]
+
+
+        for i in range(samples_view):
+            if scan_filter[i] == float('Inf'):
+                scan_filter[i] = 3.5
+            elif math.isnan(scan_filter[i]):
+                scan_filter[i] = 0
+        
+        return scan_filter
+
+    def obstacle(self):
+        twist = Twist()
+        turtlebot_moving = True
+        global stuckCount
+
+        while not rospy.is_shutdown():
+
+
+            lidar_distances = self.get_scan()
+            collideBool, collide_index, zones_angle, zones_min_distance, danger_list = collideCheckV2(lidar_distances)
+
+            #rospy.loginfo(zones_count)
+            #rospy.loginfo(zones_min_distance)
+            if collideBool:
+
+                #getAndUpdateColour()
+                    
+                optimizedTurn(self, collide_index, zones_angle, zones_min_distance, danger_list)
+                
+                #rospy.loginfo('Stop!')
+                twist.angular.z=0
+
+            else:
+                twist.linear.x = LINEAR_VEL*direction_coefficient
+                twist.angular.z = 0.0
+                stuckCount=0
+                self._cmd_pub.publish(twist)
+                #rospy.loginfo('Distance of the obstacle : %f', min_distance)
+
+def main():
+    rospy.init_node('turtlebot3_obstacle')
+    #rospy.Subscriber('/odom',Odometry,callback)
+
+    try:
+        obstacle = Obstacle()
+    except rospy.ROSInterruptException:
+        pass
+
+if __name__ == '__main__':
+    main()
